@@ -1,0 +1,17 @@
+# Register the standalone whale companion and seed its live settings.
+- insert:
+    - id: drool-whale-pet
+      name: '@dsh-external/dsh-client-plugin-drool-whale-pet'
+      config:
+        enabled: true
+        scale: 0.6552
+        bubbleScale: 0.78
+        activityLevel: normal
+        reducedMotion: false
+        bubbleMode: always
+        bubbleStates:
+          - SUCCESS
+          - ERROR
+          - WAITING
+        includeSubagents: false
+

@@ -1,0 +1,85 @@
+{
+  "name": "@dsh-external/dsh-client-plugin-drool-whale-pet",
+  "description": "Standalone animated whale desktop companion for DeepSeek Harness",
+  "version": "0.1.0",
+  "private": true,
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yunxiiQwQ/drool-whale-pet-for-dsh.git"
+  },
+  "homepage": "https://github.com/yunxiiQwQ/drool-whale-pet-for-dsh#readme",
+  "bugs": {
+    "url": "https://github.com/yunxiiQwQ/drool-whale-pet-for-dsh/issues"
+  },
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [],
+      "platform": "web"
+    }
+  },
+  "scripts": {
+    "build": "tsdown",
+    "watch": "tsdown --watch",
+    "lint": "biome check .",
+    "lint:fix": "biome check --write .",
+    "typecheck": "tsc -p tsconfig.vitest.json --noEmit",
+    "test": "vitest run",
+    "build:helper:windows": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-helper.ps1",
+    "test:helper:packaged": "node scripts/test-packaged-helper.mjs",
+    "test:python": "py -3 -m unittest discover -s runtime/tests -t ."
+  },
+  "license": "BSD-3-Clause",
+  "packageManager": "pnpm@11.21.0",
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.5.9",
+    "@deepseek-ai/cordis": "^4.0.1",
+    "@deepseek-ai/schemastery": "^3.18.1",
+    "@types/node": "^26.2.0",
+    "@types/react": "^18.3.0",
+    "jsdom": "29.1.1",
+    "lightningcss": "^1.32.0",
+    "react": "^18.0.0",
+    "tsdown": "^0.22.2",
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.8"
+  },
+  "files": [
+    "lib/index.js",
+    "lib/client.js",
+    "cordis.patch.yml",
+    "README.md",
+    "README.en.md",
+    "preview/pet-working.png",
+    "LICENSE",
+    "NOTICE",
+    "runtime/__init__.py",
+    "runtime/animation_model.py",
+    "runtime/helper.py",
+    "runtime/layout_store.py",
+    "runtime/bin/win32-x64/drool-whale-pet-helper.exe",
+    "assets/pet/",
+    "assets/pet-manifest.json",
+    "scripts/build-helper.ps1",
+    "scripts/test-packaged-helper.mjs",
+    "requirements.txt"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "engines": {
+    "node": ">=22.19"
+  }
+}
