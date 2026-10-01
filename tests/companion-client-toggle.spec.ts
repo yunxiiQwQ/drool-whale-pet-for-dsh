@@ -13,6 +13,35 @@ afterEach(() => {
 })
 
 describe('companion quick toggle', () => {
+  it('serializes rapid clicks and keeps the latest optimistic state', async () => {
+    const pending: Array<(response: Response) => void> = []
+    const patches: boolean[] = []
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((_url: string, init?: RequestInit) => {
+        if (init?.method !== 'PATCH') return Promise.resolve(new Response('{"enabled":true}'))
+        patches.push(JSON.parse(String(init.body)).enabled)
+        return new Promise<Response>((resolve) => pending.push(resolve))
+      }),
+    )
+    const { createQuickToggle } = await import('../src/client/quick-toggle.ts')
+    const controller = createQuickToggle(document.body)
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 0))
+      const button = document.querySelector<HTMLButtonElement>('button[aria-label="鲸鱼桌宠开关"]')!
+      button.click()
+      button.click()
+      await vi.waitFor(() => expect(patches).toEqual([false]))
+      pending[0](new Response('{"enabled":false}'))
+      await vi.waitFor(() => expect(patches).toEqual([false, true]))
+      expect(button.getAttribute('aria-pressed')).toBe('true')
+      pending[1](new Response('{"enabled":true}'))
+      await vi.waitFor(() => expect(button.getAttribute('aria-pressed')).toBe('true'))
+    } finally {
+      controller.dispose()
+    }
+  })
+
   it('loads, updates, and disposes the pet enabled state', async () => {
     const modulePath = resolve(root, 'src/client/quick-toggle.ts')
     expect(existsSync(modulePath)).toBe(true)

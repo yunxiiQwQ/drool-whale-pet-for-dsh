@@ -1,12 +1,11 @@
+import { spawnSync } from 'node:child_process'
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join, resolve } from 'node:path'
 import { describe, expect, it } from 'vitest'
-import {
-  HelperProcess,
-  defaultCommand,
-  isWsl,
-  resolveHelperLaunch,
-  shouldUseBundledHelper,
-} from '../src/host/helper-process.js'
+import { bundledHelperPath, HelperProcess, isWsl, resolveHelperLaunch } from '../src/host/helper-process.js'
 import { CompanionMessageKind, CompanionState, createMessage } from '../src/host/protocol.js'
+import { lowIntegrityEnvironment } from '../src/host/windows-helper-env.js'
 
 const fakeNodeHelper = [
   "const readline = require('node:readline')",
@@ -26,12 +25,124 @@ async function waitFor(predicate: () => boolean, timeoutMs = 8000): Promise<void
   throw new Error('timed out waiting for helper condition')
 }
 
+describe('Windows Low integrity helper recovery', () => {
+  it.skipIf(process.platform !== 'win32')(
+    'starts the packaged renderer and saves layout with its Low label intact',
+    async () => {
+      // LocalLow propagates its Low label to this disposable copy of the real EXE.
+      const directory = mkdtempSync(join(process.env.USERPROFILE!, "AppData/LocalLow/dsh-helper-test-鲸鱼'&-"))
+      const executable = join(directory, 'helper.exe')
+      const snapshot = join(directory, 'snapshot.png')
+      const layout = join(directory, 'layout.json')
+      const diagnosticPath = join(directory, 'startup.json')
+      copyFileSync(bundledHelperPath, executable)
+      const warnings: string[] = []
+      const helper = new HelperProcess(
+        {
+          command: executable,
+          args: [],
+          snapshot,
+          diagnosticPath,
+          env: { DSH_DROOL_WHALE_LAYOUT_PATH: layout },
+          restartDelayMs: 10,
+          heartbeatMs: 0,
+          maxStartFailures: 1,
+        },
+        {
+          ...console,
+          info() {},
+          warn: (line: string) => warnings.push(line),
+          error: (line: string) => warnings.push(line),
+        },
+      )
+      try {
+        helper.start()
+        helper.send(createMessage(CompanionMessageKind.CONFIG, { scale: 0.7 }))
+        await waitFor(() => helper.spawned && existsSync(snapshot), 20000).catch((error) => {
+          throw new Error(`${error.message}\n${warnings.join('\n')}\n${readFileSync(diagnosticPath, 'utf8')}`)
+        })
+        expect(warnings.join('\n')).toContain('Could not create temporary directory!')
+        helper.stop()
+        await waitFor(() => !helper.child)
+        expect(JSON.parse(readFileSync(layout, 'utf8')).scale).toBe(0.7)
+        const diagnostic = JSON.parse(readFileSync(diagnosticPath, 'utf8'))
+        expect(diagnostic.readyAt).toBeTruthy()
+        expect(diagnostic.exitCode).toBe(0)
+        expect(diagnostic.recovery).toBe('low-integrity-temp')
+        expect(diagnostic.stderr).toContain('Could not create temporary directory!')
+        // The identical EXE still fails with the original medium-integrity TEMP.
+        const originalEnv = spawnSync(executable, ['--headless'], { encoding: 'utf8', timeout: 10000 })
+        expect(originalEnv.stderr).toContain('Could not create temporary directory!')
+      } finally {
+        helper.stop()
+        if (helper.child) {
+          helper.child.kill()
+          await waitFor(() => !helper.child)
+        }
+        rmSync(directory, { recursive: true, force: true })
+      }
+    },
+    35000,
+  )
+
+  it('records a failed start with stderr and exit code', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'dsh-helper-diagnostic-'))
+    const diagnosticPath = resolve(directory, 'startup.json')
+    const helper = new HelperProcess(
+      {
+        command: process.execPath,
+        args: ['-e', 'process.stderr.write("startup fixture failed\\n"); process.exitCode = 7'],
+        diagnosticPath,
+        maxStartFailures: 1,
+      },
+      { ...console, warn() {}, error() {} },
+    )
+    try {
+      helper.start()
+      await waitFor(() => helper.restartSuppressed)
+      const diagnostic = JSON.parse(readFileSync(diagnosticPath, 'utf8'))
+      expect(diagnostic.stderr).toContain('startup fixture failed')
+      expect(diagnostic.exitCode).toBe(7)
+      expect(diagnostic.readyAt).toBeUndefined()
+    } finally {
+      helper.stop()
+      rmSync(directory, { recursive: true, force: true })
+    }
+  })
+
+  it.skipIf(process.platform !== 'win32')('keeps ordinary executables on their existing temporary directory', () => {
+    expect(lowIntegrityEnvironment(process.execPath, process.env)).toBeUndefined()
+  })
+})
+
 describe('helper process launch resolution', () => {
-  it('exposes WSL detection helpers without throwing', () => {
+  it('detects WSL without throwing', () => {
     expect(typeof isWsl()).toBe('boolean')
-    expect(typeof shouldUseBundledHelper()).toBe('boolean')
-    expect(typeof defaultCommand()).toBe('string')
-    expect(typeof defaultCommand(true)).toBe('string')
+  })
+
+  it('does not auto-launch an unprovisioned Python helper on ordinary Linux', () => {
+    const launch = resolveHelperLaunch({
+      platform: 'linux',
+      isWslEnv: false,
+      bundledPath: '/app/runtime/bin/win32-x64/drool-whale-pet-helper.exe',
+      helperPath: '/app/runtime/helper.py',
+      pythonEnv: undefined,
+      fileExists: () => true,
+    })
+    expect(launch).toBeUndefined()
+  })
+
+  it('does not launch the bundled x64 helper on Windows ARM64', () => {
+    const launch = resolveHelperLaunch({
+      platform: 'win32',
+      arch: 'arm64',
+      isWslEnv: false,
+      bundledPath: 'C:/app/runtime/bin/win32-x64/drool-whale-pet-helper.exe',
+      helperPath: 'C:/app/runtime/helper.py',
+      pythonEnv: undefined,
+      fileExists: () => true,
+    })
+    expect(launch).toBeUndefined()
   })
 
   it('prefers the bundled executable on win32 when it exists', () => {
@@ -54,7 +165,7 @@ describe('helper process launch resolution', () => {
       helperPath: 'C:/app/runtime/helper.py',
       pythonEnv: undefined,
       fileExists: () => false,
-    })
+    })!
     expect(launch.command).toBe('py')
     // defaultArgs keys off the REAL process platform (vendored behavior), so
     // the '-3' launcher flag only appears when the suite itself runs on win32.
@@ -63,7 +174,7 @@ describe('helper process launch resolution', () => {
     )
   })
 
-  it('launches the bundled executable through cmd.exe from WSL', () => {
+  it('launches the bundled executable through a fixed PowerShell expression from WSL', () => {
     const launch = resolveHelperLaunch({
       platform: 'linux',
       isWslEnv: true,
@@ -72,14 +183,150 @@ describe('helper process launch resolution', () => {
       pythonEnv: undefined,
       fileExists: () => true,
       windowsPath: (path: string) => `C:\\${path}`,
-      cmdExe: () => 'C:\\Windows\\System32\\cmd.exe',
+      powerShellExe: () => 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe',
+    })!
+    expect(launch.command).toBe('C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe')
+    expect(launch.args).toEqual([
+      '-NoLogo',
+      '-NoProfile',
+      '-NonInteractive',
+      '-Command',
+      '& $env:DSH_DROOL_WHALE_HELPER_EXE',
+    ])
+    expect(launch.env).toEqual({
+      DSH_DROOL_WHALE_HELPER_EXE: 'C:\\/mnt/c/app/runtime/bin/win32-x64/drool-whale-pet-helper.exe',
     })
-    expect(launch.command).toBe('C:\\Windows\\System32\\cmd.exe')
-    expect(launch.args).toEqual(['/d', '/c', 'C:\\/mnt/c/app/runtime/bin/win32-x64/drool-whale-pet-helper.exe'])
+  })
+
+  it('quotes the WSL helper as one cmd command even when its path has metacharacters', () => {
+    const launch = resolveHelperLaunch({
+      platform: 'linux',
+      isWslEnv: true,
+      bundledPath: '/mnt/c/Whale & echo INJECTED/helper.exe',
+      helperPath: '/app/runtime/helper.py',
+      pythonEnv: undefined,
+      fileExists: () => true,
+      windowsPath: () => 'C:\\Whale & echo INJECTED\\helper.exe',
+      powerShellExe: () => 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe',
+    })!
+    expect(launch.args.join(' ')).not.toContain('INJECTED')
+    expect(launch.env).toEqual({ DSH_DROOL_WHALE_HELPER_EXE: 'C:\\Whale & echo INJECTED\\helper.exe' })
+  })
+
+  it.runIf(process.platform === 'win32')('executes a metacharacter path without interpreting it', () => {
+    const root = mkdtempSync(join(tmpdir(), 'maid-whale-launch-'))
+    const unsafeDirectory = join(root, 'Whale & echo INJECTED')
+    const script = join(unsafeDirectory, 'helper.cmd')
+    mkdirSync(unsafeDirectory)
+    writeFileSync(script, '@echo SAFE_MARKER\r\n', 'ascii')
+    try {
+      const launch = resolveHelperLaunch({
+        platform: 'linux',
+        isWslEnv: true,
+        bundledPath: '/mnt/c/Whale & echo INJECTED/helper.cmd',
+        helperPath: '/app/runtime/helper.py',
+        pythonEnv: undefined,
+        fileExists: () => true,
+        windowsPath: () => script,
+        powerShellExe: () => 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe',
+      })!
+      const result = spawnSync(launch.command, launch.args, {
+        encoding: 'utf8',
+        env: { ...process.env, ...launch.env },
+        windowsHide: true,
+      })
+      expect(result.status).toBe(0)
+      expect(result.stdout.trim()).toBe('SAFE_MARKER')
+      expect(result.stderr.trim()).toBe('')
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
   })
 })
 
 describe('helper process bridge', () => {
+  it.each([false, true])(
+    'bounds blocked writes and drains cleanly (stop while blocked: %s)',
+    async (stopEarly) => {
+      const source = [
+        "console.log(JSON.stringify({ protocolVersion: 1, kind: 'ready' }))",
+        "setTimeout(() => require('node:readline').createInterface({ input: process.stdin }).on('line', line => { const message = JSON.parse(line); console.log(JSON.stringify({ kind: message.kind, index: message.index })) }), 800)",
+      ].join('; ')
+      const bridge = new HelperProcess(
+        { command: process.execPath, args: ['-e', source], heartbeatMs: 0, maxQueuedMessages: 4 },
+        { debug() {}, info() {}, warn() {}, error() {} } as unknown as Console,
+      )
+      const child = bridge.start()!
+      const replies: string[] = []
+      child.stdout.on('data', (chunk: Buffer) => replies.push(chunk.toString()))
+      const closed = new Promise<void>((resolve) => child.once('close', () => resolve()))
+      try {
+        await waitFor(() => bridge.spawned)
+        for (let index = 0; index < 128; index += 1) {
+          bridge.send(
+            createMessage(CompanionMessageKind.STATE, {
+              state: CompanionState.WORKING,
+              message: 'x'.repeat(65536),
+              index,
+            }),
+          )
+        }
+        for (let index = 0; index < 8; index += 1) {
+          bridge.send(createMessage(CompanionMessageKind.PULSE, { state: CompanionState.SUCCESS, index }))
+        }
+        expect(child.stdin.writableLength).toBeLessThan(128 * 1024)
+        expect(bridge.queue.length).toBeLessThanOrEqual(4)
+        if (!stopEarly) {
+          await waitFor(() => replies.join('').includes('"kind":"state","index":127'))
+          await waitFor(() => replies.join('').includes('"kind":"pulse","index":7'))
+        }
+        bridge.stop('backpressure-test')
+        await waitFor(() => replies.join('').includes('"kind":"shutdown"'))
+        await closed
+        expect(child.exitCode).toBe(0)
+      } finally {
+        bridge.stop('test-cleanup')
+        if (child.exitCode === null) child.kill()
+        await closed
+      }
+    },
+    15000,
+  )
+
+  it('keeps only durable snapshots and a bounded transient queue before READY', () => {
+    const bridge = new HelperProcess({ maxQueuedMessages: 4 }, console)
+    for (let index = 0; index < 20; index += 1) {
+      bridge.send(
+        createMessage(CompanionMessageKind.STATE, {
+          state: CompanionState.WORKING,
+          message: `state-${index}`,
+        }),
+      )
+      bridge.send(
+        createMessage(CompanionMessageKind.PULSE, {
+          state: CompanionState.SUCCESS,
+          ttlMs: 1000,
+          message: `pulse-${index}`,
+        }),
+      )
+    }
+    expect(bridge.snapshot.size).toBe(1)
+    expect(bridge.queue).toHaveLength(4)
+    expect(bridge.queue.at(-1)).toContain('pulse-19')
+  })
+
+  it('does not retain new traffic after restart suppression', () => {
+    const bridge = new HelperProcess({ maxQueuedMessages: 4 }, console)
+    bridge.restartSuppressed = true
+    bridge.send(
+      createMessage(CompanionMessageKind.PULSE, {
+        state: CompanionState.ERROR,
+        ttlMs: 1000,
+      }),
+    )
+    expect(bridge.queue).toHaveLength(0)
+  })
+
   it('queues messages before readiness, flushes them after, and shuts down cleanly', async () => {
     const replies: string[] = []
     const logger = { debug() {}, info() {}, warn() {}, error() {} }

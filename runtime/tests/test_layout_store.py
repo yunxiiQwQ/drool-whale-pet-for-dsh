@@ -1,21 +1,87 @@
 import json
+import os
 import tempfile
 import unittest
-from unittest.mock import patch
 from pathlib import Path
+from unittest.mock import patch
 
-from runtime.layout_store import DEFAULT_LAYOUT, default_layout_path, load_layout, normalise_layout, save_layout
+from runtime.layout_store import (
+    DeferredLayoutSaver,
+    DEFAULT_LAYOUT,
+    default_layout_path,
+    load_layout,
+    normalise_layout,
+    save_layout,
+)
+
+
+class FakeTimer:
+    def __init__(self, delay, callback):
+        self.delay = delay
+        self.callback = callback
+        self.cancelled = False
+        self.daemon = False
+
+    def start(self):
+        return None
+
+    def cancel(self):
+        self.cancelled = True
 
 
 class LayoutStoreTests(unittest.TestCase):
-    def test_default_path_uses_the_standalone_plugin_directory(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            with patch.dict("os.environ", {"DSH_HOME": directory}, clear=True):
-                self.assertEqual(default_layout_path(), Path(directory) / "drool-whale-pet" / "layout.json")
+    def test_deferred_saver_coalesces_and_flushes_latest_value(self) -> None:
+        timers = []
+        writes = []
+        factory = lambda delay, callback: timers.append(FakeTimer(delay, callback)) or timers[-1]
+        saver = DeferredLayoutSaver(
+            Path("layout.json"),
+            save=lambda _path, value: writes.append(value),
+            timer_factory=factory,
+        )
+        saver.schedule({"scale": 0.7})
+        saver.schedule({"scale": 1.0})
+        self.assertTrue(timers[0].cancelled)
+        self.assertEqual(writes, [])
+        timers[0].callback()
+        self.assertEqual(writes, [])
+        saver.flush()
+        self.assertEqual(writes[-1]["scale"], 1.0)
+        self.assertTrue(timers[1].cancelled)
+
+    def test_deferred_saver_timer_and_flush_write_once(self) -> None:
+        timers = []
+        writes = []
+        factory = lambda delay, callback: timers.append(FakeTimer(delay, callback)) or timers[-1]
+        saver = DeferredLayoutSaver(
+            Path("layout.json"),
+            save=lambda _path, value: writes.append(value),
+            timer_factory=factory,
+        )
+        saver.schedule({"scale": 0.9})
+        timers[0].callback()
+        saver.flush()
+        self.assertEqual(len(writes), 1)
+        self.assertEqual(writes[0]["scale"], 0.9)
 
     def test_pet_and_bubble_defaults_match_requested_size(self) -> None:
         self.assertEqual(DEFAULT_LAYOUT["scale"], 0.6552)
         self.assertEqual(DEFAULT_LAYOUT["bubbleScale"], 0.78)
+
+    def test_default_layout_path_uses_each_supported_location_in_priority_order(self) -> None:
+        with patch.dict(os.environ, {"DSH_DROOL_WHALE_LAYOUT_PATH": "D:/custom/layout.json"}, clear=True):
+            self.assertEqual(default_layout_path(), Path("D:/custom/layout.json"))
+        with patch.dict(os.environ, {"DSH_HOME": "D:/dsh"}, clear=True):
+            self.assertEqual(default_layout_path(), Path("D:/dsh/drool-whale-pet/layout.json"))
+        with patch.dict(os.environ, {"LOCALAPPDATA": "D:/local"}, clear=True):
+            self.assertEqual(default_layout_path(), Path("D:/local/DSH/drool-whale-pet/layout.json"))
+        with patch.dict(os.environ, {}, clear=True), patch(
+            "runtime.layout_store.Path.home", return_value=Path("D:/home")
+        ):
+            self.assertEqual(default_layout_path(), Path("D:/home/.dsh/drool-whale-pet/layout.json"))
+
+    def test_non_mapping_layout_uses_defaults(self) -> None:
+        self.assertEqual(normalise_layout(None), DEFAULT_LAYOUT)
 
     def test_compact_scales_are_preserved_and_lower_values_are_clamped(self) -> None:
         self.assertEqual(normalise_layout({"scale": 0.42, "bubbleScale": 0.6})["scale"], 0.42)

@@ -28,6 +28,12 @@ dsh --profile web
 
 Configure size, bubbles, and motion under **Settings → Plugins → Plugin config → Whale companion**, or use the whale button at the bottom-right of the workspace to toggle it immediately.
 
+For the desktop app, install with `dsh plugin --profile desktop add .` and start DSH from its desktop shortcut. The companion's “Open DSH” menu item brings up the desktop window.
+
+On Windows, if a Low integrity label prevents the helper from creating its temporary directory, the plugin checks the label and retries using `%USERPROFILE%\AppData\LocalLow\DSH\drool-whale-pet` for temporary files and layout storage. An explicit `DSH_DROOL_WHALE_LAYOUT_PATH` takes precedence and must be writable by a Low integrity process.
+
+Startup diagnostics are saved to `%LOCALAPPDATA%\DSH\drool-whale-pet\helper-startup.json`, including startup time, ready status, exit code, and up to 4096 characters of startup stderr. The initial failure remains in the record after recovery. To update, fully exit DSH, run `git pull` in the repository directory, then restart DSH.
+
 To uninstall:
 
 ```powershell

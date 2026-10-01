@@ -1,5 +1,7 @@
 node_modules/
-lib/
+lib/*
+!lib/index.js
+!lib/client.js
 coverage/
 *.tgz
 .build/

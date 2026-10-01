@@ -28,6 +28,12 @@ dsh --profile web
 
 桌宠启动后，可在 **设置 → 插件 → 插件配置 → 鲸鱼桌宠** 中调整大小、气泡和动态效果，也可以使用工作区右下角的鲸鱼按钮即时启停。
 
+桌面端使用 `dsh plugin --profile desktop add .` 安装后，从桌面快捷方式启动 DSH。桌宠菜单中的“打开 DSH”会唤起桌面窗口。
+
+Windows 下，若 Low 完整性标签导致 helper 无法创建临时目录，插件会检测标签并自动使用 `%USERPROFILE%\AppData\LocalLow\DSH\drool-whale-pet` 重试，该目录也用于保存桌宠布局。显式配置的 `DSH_DROOL_WHALE_LAYOUT_PATH` 仍优先使用，需指向 Low 进程可写的位置。
+
+启动诊断保存在 `%LOCALAPPDATA%\DSH\drool-whale-pet\helper-startup.json`，记录启动时间、ready 状态、退出码及最多 4096 字符的启动 stderr。成功恢复后会保留首次失败记录，便于排查。更新时先完全退出 DSH，在仓库目录运行 `git pull`，再启动 DSH。
+
 卸载：
 
 ```powershell

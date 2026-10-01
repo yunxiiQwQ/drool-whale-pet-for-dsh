@@ -1,9 +1,10 @@
 import { execFileSync, spawn } from 'node:child_process'
-import { existsSync, readFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { dirname, resolve } from 'node:path'
 import { createInterface } from 'node:readline'
 import { CompanionMessageKind, createMessage, encodeMessage } from './protocol.js'
+import { lowIntegrityEnvironment } from './windows-helper-env.js'
 
 // Vendored from QCYTSN/dsh-dafeiyu (MIT). The DSH_DROOL_WHALE_* environment variable
 // names are the runtime contract read by runtime/helper.py; renaming them here
@@ -17,6 +18,13 @@ const packageRoot =
   resolve(here, '..')
 const defaultHelperPath = resolve(packageRoot, 'runtime', 'helper.py')
 const bundledHelperPath = resolve(packageRoot, 'runtime', 'bin', 'win32-x64', 'drool-whale-pet-helper.exe')
+const DURABLE_MESSAGE_KINDS = new Set([
+  CompanionMessageKind.HELLO,
+  CompanionMessageKind.STATE,
+  CompanionMessageKind.TASK,
+  CompanionMessageKind.TASKS,
+  CompanionMessageKind.CONFIG,
+])
 
 function isWsl() {
   if (process.platform !== 'linux') return false
@@ -31,26 +39,21 @@ function isWsl() {
   }
 }
 
-function shouldUseBundledHelper() {
-  return (process.platform === 'win32' || isWsl()) && existsSync(bundledHelperPath)
-}
-
 function toWindowsPath(path) {
   return execFileSync('wslpath', ['-w', path], { encoding: 'utf8' }).trim()
 }
 
-function defaultCmdExe({ wslpath = defaultWslPath, fileExists = existsSync } = {}) {
-  // WSL visual mode launches the bundled EXE through Windows cmd.exe. cmd.exe
-  // is usually NOT on the WSL PATH (System32 is not appended by default), so
-  // never rely on `cmd.exe` being resolvable: convert the Windows absolute path
-  // with wslpath and only fall back to the bare name as a last resort.
+function defaultPowerShellExe({ wslpath = defaultWslPath, fileExists = existsSync } = {}) {
+  // WSL visual mode launches the bundled EXE through Windows PowerShell.
+  // Keep the executable path in an environment variable so it remains data:
+  // interpolating it into cmd.exe syntax would let metacharacters become code.
   try {
-    const candidate = wslpath('C:\\Windows\\System32\\cmd.exe')
+    const candidate = wslpath('C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe')
     if (candidate && fileExists(candidate)) return candidate
   } catch {
     // Fall through to the bare-name fallback below.
   }
-  return 'cmd.exe'
+  return 'powershell.exe'
 }
 
 function defaultWslPath(...args) {
@@ -59,6 +62,7 @@ function defaultWslPath(...args) {
 
 function resolveHelperLaunch({
   platform,
+  arch = process.arch,
   isWslEnv,
   bundledPath,
   helperPath,
@@ -66,21 +70,25 @@ function resolveHelperLaunch({
   headless = false,
   fileExists = existsSync,
   windowsPath = toWindowsPath,
-  cmdExe = defaultCmdExe,
+  powerShellExe = defaultPowerShellExe,
 }) {
-  if (platform === 'win32' && fileExists(bundledPath)) {
+  const supportsBundledHelper = arch === 'x64' && (platform === 'win32' || (platform === 'linux' && isWslEnv))
+  if (platform === 'win32' && supportsBundledHelper && fileExists(bundledPath)) {
     return { command: bundledPath, args: [] }
   }
-  if (platform === 'linux' && isWslEnv && !headless && fileExists(bundledPath)) {
+  if (platform === 'linux' && isWslEnv && supportsBundledHelper && !headless && fileExists(bundledPath)) {
     // npm archives created on Windows store ordinary files as 0644. Launching
-    // the EXE directly from WSL can therefore fail with EACCES. cmd.exe opens
-    // the Windows path without relying on the Linux executable bit and keeps
-    // stdin/stdout attached for the companion protocol.
+    // the EXE directly from WSL can therefore fail with EACCES. PowerShell
+    // opens the Windows path without relying on the Linux executable bit and
+    // keeps stdin/stdout attached for the companion protocol. The fixed
+    // expression contains no path text, so shell metacharacters stay inert.
     return {
-      command: cmdExe(),
-      args: ['/d', '/c', windowsPath(bundledPath)],
+      command: powerShellExe(),
+      args: ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', '& $env:DSH_DROOL_WHALE_HELPER_EXE'],
+      env: { DSH_DROOL_WHALE_HELPER_EXE: windowsPath(bundledPath) },
     }
   }
+  if (!supportsBundledHelper && !pythonEnv) return undefined
   const command = pythonEnv || (platform === 'win32' ? 'py' : 'python3')
   return { command, args: defaultArgs(command, helperPath) }
 }
@@ -94,10 +102,6 @@ function defaultLaunch(headless = false) {
     pythonEnv: process.env.DSH_DROOL_WHALE_PYTHON,
     headless,
   })
-}
-
-function defaultCommand(headless = false) {
-  return defaultLaunch(headless).command
 }
 
 function defaultArgs(command, helperPath) {
@@ -115,8 +119,8 @@ export class HelperProcess {
     this.child = undefined
     this.queue = []
     this.snapshot = new Map()
+    this.pending = new Map()
     this.spawned = false
-    this.hasEverSpawned = false
     this.stopping = false
     this.restartSuppressed = false
     this.startFailures = 0
@@ -124,6 +128,14 @@ export class HelperProcess {
     this.heartbeatTimer = undefined
     this.startupTimer = undefined
     this.lastPongAt = 0
+    this.recoveryAttempted = false
+    this.recoveryEnv = undefined
+    this.diagnostic = { stderr: '' }
+    this.diagnosticPath =
+      options.diagnosticPath ??
+      (process.platform === 'win32' && !options.command && process.env.LOCALAPPDATA
+        ? resolve(process.env.LOCALAPPDATA, 'DSH', 'drool-whale-pet', 'helper-startup.json')
+        : undefined)
   }
 
   start() {
@@ -132,13 +144,21 @@ export class HelperProcess {
     // probing). Never let that escape: it would crash the host when it happens
     // inside the restart timer. Treat it like any other start failure instead.
     let child
+    let command
+    let env
+    let tempDirectoryFailed = false
     try {
       const headless = this.options.headless ?? process.env.DSH_DROOL_WHALE_HEADLESS === '1'
       const helperPath = this.options.helperPath || defaultHelperPath
       const launch = this.options.command
         ? { command: this.options.command, args: defaultArgs(this.options.command, helperPath) }
         : defaultLaunch(headless)
-      const command = launch.command
+      if (!launch) {
+        this.restartSuppressed = true
+        this.logger.info?.('companion helper is disabled on this platform')
+        return undefined
+      }
+      command = launch.command
       const args = this.options.args || launch.args
       const extraArgs = []
       const eventLog = this.options.eventLog || process.env.DSH_DROOL_WHALE_EVENT_LOG
@@ -147,9 +167,22 @@ export class HelperProcess {
       if (eventLog) extraArgs.push('--event-log', eventLog)
       if (snapshot) extraArgs.push('--snapshot', snapshot)
 
+      env = { ...process.env, ...this.options.env, ...launch.env }
+      // Recheck after a crash/restart: a replaced EXE may have a different label.
+      if (this.recoveryEnv) this.recoveryEnv = lowIntegrityEnvironment(command, env)
+      Object.assign(env, this.recoveryEnv)
+      this.#recordDiagnostic({
+        command,
+        startedAt: new Date().toISOString(),
+        temp: env.TMP || env.TEMP,
+        readyAt: undefined,
+        exitCode: undefined,
+        signal: undefined,
+        error: undefined,
+      })
       child = spawn(command, [...args, ...extraArgs], {
         cwd: this.options.cwd || packageRoot,
-        env: { ...process.env, ...this.options.env },
+        env,
         stdio: ['pipe', 'pipe', 'pipe'],
         windowsHide: true,
       })
@@ -157,6 +190,7 @@ export class HelperProcess {
       this.child = undefined
       this.spawned = false
       this.logger.error?.(`companion helper failed to start: ${error.message}`)
+      this.#recordDiagnostic({ error: error.message })
       if (!this.stopping && !this.restartSuppressed) {
         this.#countStartFailure(`launch error: ${error.message}`)
       }
@@ -166,6 +200,9 @@ export class HelperProcess {
     // A broken pipe on any child channel must never crash the DSH host.
     // EPIPE on stdin is expected after the helper dies before we flush.
     child.stdin.on('error', () => {})
+    child.stdin.on('drain', () => {
+      if (this.child === child) this.#flushOutgoing()
+    })
     child.stdout.on('error', () => {})
     child.stderr.on('error', () => {})
     child.once('spawn', () => {
@@ -173,6 +210,7 @@ export class HelperProcess {
       this.startupTimer = setTimeout(() => {
         if (this.child === child && !this.spawned) {
           this.logger.warn?.('companion helper readiness timed out')
+          this.#recordDiagnostic({ error: 'readiness timed out' })
           child.kill()
         }
       }, startupTimeoutMs)
@@ -180,6 +218,7 @@ export class HelperProcess {
     })
     child.once('error', (error) => {
       this.logger.error?.(`companion helper failed to start: ${error.message}`)
+      this.#recordDiagnostic({ error: error.message })
       if (this.child !== child) return
       this.child = undefined
       this.spawned = false
@@ -189,15 +228,33 @@ export class HelperProcess {
         this.#countStartFailure(`spawn error: ${error.message}`)
       }
     })
-    child.once('exit', (code, signal) => {
+    // close follows stderr EOF, so even a fast bootloader failure is available
+    // before deciding whether to retry with the Low-integrity environment.
+    child.once('close', (code, signal) => {
       if (this.child !== child) return
       this.child = undefined
       const wasReady = this.spawned
       this.spawned = false
       this.#clearHeartbeat()
       this.#clearStartupTimer()
+      this.#recordDiagnostic({ exitCode: code, signal })
       if (!this.stopping && !this.restartSuppressed) {
         if (!wasReady) {
+          if (process.platform === 'win32' && tempDirectoryFailed && !this.recoveryAttempted) {
+            this.recoveryAttempted = true
+            try {
+              this.recoveryEnv = lowIntegrityEnvironment(command, env)
+              if (this.recoveryEnv) {
+                this.#recordDiagnostic({ recovery: 'low-integrity-temp' })
+                this.logger.info?.('companion helper has a Low integrity label; retrying with LocalLow storage')
+                this.#scheduleRestart()
+                return
+              }
+            } catch (error) {
+              this.#recordDiagnostic({ recoveryError: error.message })
+              this.logger.warn?.(`companion helper integrity check failed: ${error.message}`)
+            }
+          }
           // The helper never became ready during this attempt (crashed before
           // READY or timed out). Count it as a failed start so a broken
           // helper cannot restart forever.
@@ -211,30 +268,42 @@ export class HelperProcess {
     createInterface({ input: child.stdout }).on('line', (line) => this.#handleReply(line))
     createInterface({ input: child.stderr }).on('line', (line) => {
       if (line.trim()) this.logger.warn?.(`companion helper: ${line}`)
+      if (!this.spawned) {
+        tempDirectoryFailed ||= /\[PYI-\d+:ERROR\] Could not create temporary directory!/.test(line)
+        this.#recordDiagnostic({ stderr: `${this.diagnostic.stderr}${line}\n`.slice(-4096) })
+      }
     })
     return child
   }
 
   send(message) {
-    this.#remember(message)
+    if (this.stopping || this.restartSuppressed) return
     const line = encodeMessage(message)
-    if (!this.child || !this.spawned || !this.child.stdin.writable || this.child.stdin.destroyed) {
-      if (
-        !this.hasEverSpawned ||
-        ![
-          CompanionMessageKind.HELLO,
-          CompanionMessageKind.STATE,
-          CompanionMessageKind.TASK,
-          CompanionMessageKind.TASKS,
-          CompanionMessageKind.PULSE,
-          CompanionMessageKind.CONFIG,
-        ].includes(message.kind)
-      ) {
-        this.queue.push(line)
-      }
+    const durable = DURABLE_MESSAGE_KINDS.has(message.kind)
+    if (durable) this.snapshot.set(message.kind, line)
+    if (
+      !this.child ||
+      !this.spawned ||
+      !this.child.stdin.writable ||
+      this.child.stdin.destroyed ||
+      this.child.stdin.writableNeedDrain
+    ) {
+      if (durable) this.pending.set(message.kind, line)
+      else this.#enqueue(line)
       return
     }
     this.child.stdin.write(line)
+  }
+
+  #recordDiagnostic(fields) {
+    Object.assign(this.diagnostic, fields)
+    if (!this.diagnosticPath) return
+    try {
+      mkdirSync(dirname(this.diagnosticPath), { recursive: true })
+      writeFileSync(this.diagnosticPath, `${JSON.stringify(this.diagnostic, null, 2)}\n`)
+    } catch (error) {
+      this.logger.warn?.(`companion helper diagnostic could not be saved: ${error.message}`)
+    }
   }
 
   stop(reason = 'plugin-disposed') {
@@ -244,37 +313,35 @@ export class HelperProcess {
     this.restartTimer = undefined
     const child = this.child
     if (!child) return
-    this.queue.push(encodeMessage(createMessage(CompanionMessageKind.SHUTDOWN, { reason })))
-    if (this.spawned) {
-      this.#flushQueue()
-      this.#endInput(child)
-    }
+    this.pending.clear()
+    this.queue = [encodeMessage(createMessage(CompanionMessageKind.SHUTDOWN, { reason }))]
+    this.#flushOutgoing()
     const timer = setTimeout(() => {
       if (this.child === child) child.kill()
     }, this.options.shutdownTimeoutMs ?? 10000)
     timer.unref?.()
   }
 
-  #remember(message) {
-    if (message.kind === CompanionMessageKind.HELLO) this.snapshot.set('hello', encodeMessage(message))
-    if (message.kind === CompanionMessageKind.STATE) this.snapshot.set('state', encodeMessage(message))
-    if (message.kind === CompanionMessageKind.TASK) this.snapshot.set('task', encodeMessage(message))
-    if (message.kind === CompanionMessageKind.TASKS) this.snapshot.set('tasks', encodeMessage(message))
-    if (message.kind === CompanionMessageKind.CONFIG) this.snapshot.set('config', encodeMessage(message))
+  #enqueue(line) {
+    const limit = Math.max(0, this.options.maxQueuedMessages ?? 64)
+    if (limit === 0) return
+    this.queue.push(line)
+    if (this.queue.length > limit) this.queue.splice(0, this.queue.length - limit)
   }
 
-  #flushSnapshot() {
+  #flushOutgoing() {
     const child = this.child
-    if (!this.spawned || !child?.stdin.writable || child.stdin.destroyed) return
-    const payload = [...this.snapshot.values()].join('')
-    if (payload) child.stdin.write(payload)
-  }
-
-  #flushQueue() {
-    const child = this.child
-    if (!this.spawned || !child?.stdin.writable || child.stdin.destroyed) return
-    const payload = this.queue.splice(0).join('')
-    if (payload) child.stdin.write(payload)
+    if (!this.spawned || !child?.stdin.writable || child.stdin.destroyed || child.stdin.writableNeedDrain) return
+    // A false write result means the line was accepted, but subsequent lines
+    // must wait for drain. Coalesce durable updates while that pipe is full.
+    for (const [kind, line] of this.pending) {
+      this.pending.delete(kind)
+      if (!child.stdin.write(line)) return
+    }
+    while (this.queue.length) {
+      if (!child.stdin.write(this.queue.shift())) return
+    }
+    if (this.stopping) this.#endInput(child)
   }
 
   #handleReply(line) {
@@ -283,19 +350,14 @@ export class HelperProcess {
       const reply = JSON.parse(line)
       if (reply?.protocolVersion === 1 && reply.kind === CompanionMessageKind.READY) {
         if (this.spawned) return
-        const firstSpawn = !this.hasEverSpawned
-        this.hasEverSpawned = true
         this.spawned = true
+        this.#recordDiagnostic({ readyAt: new Date().toISOString(), exitCode: undefined, signal: undefined })
         this.startFailures = 0
         this.lastPongAt = Date.now()
         this.#clearStartupTimer()
-        if (firstSpawn) this.#flushQueue()
-        else {
-          this.#flushSnapshot()
-          this.#flushQueue()
-        }
-        this.#startHeartbeat()
-        if (this.stopping) this.#endInput(this.child)
+        this.pending = new Map(this.stopping ? [] : this.snapshot)
+        this.#flushOutgoing()
+        if (!this.stopping) this.#startHeartbeat()
         return
       }
       if (reply?.protocolVersion === 1 && reply.kind === CompanionMessageKind.PONG) {
@@ -344,6 +406,7 @@ export class HelperProcess {
     const maxFailures = this.options.maxStartFailures ?? 5
     if (this.startFailures >= maxFailures) {
       this.restartSuppressed = true
+      this.queue.length = 0
       this.logger.error?.(`companion helper failed to start ${this.startFailures} times; giving up (${reason})`)
       return
     }
@@ -372,11 +435,9 @@ export {
   bundledHelperPath,
   defaultHelperPath,
   defaultArgs,
-  defaultCmdExe,
-  defaultCommand,
+  defaultPowerShellExe,
   defaultLaunch,
   isWsl,
   resolveHelperLaunch,
-  shouldUseBundledHelper,
   toWindowsPath,
 }

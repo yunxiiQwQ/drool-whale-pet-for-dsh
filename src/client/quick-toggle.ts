@@ -1,4 +1,5 @@
 import css from './companion.module.css'
+import { writeCompanionConfig } from './config-writes.ts'
 
 const CONFIG_ENDPOINT = '/plugins/drool-whale-pet/config'
 
@@ -20,6 +21,7 @@ export function createQuickToggle(root: HTMLElement): QuickToggleController {
   button.append(icon)
 
   let enabled = true
+  let patchSeq = 0
   let disposed = false
   let positionFrame: number | undefined
 
@@ -48,18 +50,15 @@ export function createQuickToggle(root: HTMLElement): QuickToggleController {
   }
 
   const writeEnabled = async (next: boolean): Promise<void> => {
+    const seq = ++patchSeq
     enabled = next
     sync()
     try {
-      const response = await fetch(CONFIG_ENDPOINT, {
-        method: 'PATCH',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ enabled: next }),
-      })
-      if (!response.ok) return
-      const config = (await response.json()) as { enabled?: boolean }
-      enabled = config.enabled !== false
-      if (!disposed) sync()
+      const config = (await writeCompanionConfig({ enabled: next })) as { enabled?: boolean }
+      if (seq === patchSeq) {
+        enabled = config.enabled !== false
+        if (!disposed) sync()
+      }
     } catch {
       // Keep the optimistic state. A later click retries the host endpoint.
     }
